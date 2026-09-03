@@ -1,0 +1,142 @@
+# -*- coding: utf-8 -*-
+"""
+MODELE FINAL - DATASET_CLEAN_STEP2 (CORRIGE) + BLEND XGBOOST/CATBOOST
+==========================================================================
+Ce dataset (9695 lignes, avec floor_appartement et rooms_info_known)
+donne un net progres par rapport a nos resultats precedents - MAIS un
+bug de prix identique a celui deja trouve sur notre propre scraping
+(chiffre parasite colle au debut du prix) a d'abord ete corrige
+(284 lignes, toutes sur Appartement, prix/m2 jusqu'a 802 985 DH/m2
+avant correction -> 20 540 DH/m2 apres, plausible).
+
+Entree : dataset_clean_step2.csv (dataset externe fourni)
+Sortie : ce script + dataset_clean_step2_corrige.csv
+
+Resultat :
+  XGBoost seul  : R2=0.7601
+  CatBoost seul : R2=0.7928
+  Blend (30% XGB / 70% CatBoost) : R2=0.7942  MAE=653 524 DH
+"""
+
+import pandas as pd
+import numpy as np
+from xgboost import XGBRegressor
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from catboost import CatBoostRegressor, Pool
+
+FICHIER_ENTREE = "dataset_clean_step2.csv"
+POIDS_XGB = 0.30  # trouve par recherche sur la grille 0.3-1.0
+
+BORNES_M2 = {
+    "Appartement": (1000, 150000),
+    "Maison": (500, 100000),
+    "Villa": (500, 120000),
+}
+
+
+def corriger_bug_prix(df):
+    """Corrige le chiffre parasite colle au debut du prix (meme bug que
+    sur notre propre scraping Avito), verifie via le prix au m2."""
+    def enlever_premier_chiffre(prix):
+        s = str(int(prix))
+        return int(s[1:]) if len(s) > 1 else prix
+
+    total_corrige = 0
+    for t, (mini, maxi) in BORNES_M2.items():
+        masque_type = df["property_type"] == t
+        pm2 = df.loc[masque_type, "price_dh"] / df.loc[masque_type, "surface_m2"]
+        masque_suspect = masque_type & ((pm2 > maxi) | (pm2 < mini))
+        if masque_suspect.sum() == 0:
+            continue
+        prix_corrige = df.loc[masque_suspect, "price_dh"].apply(enlever_premier_chiffre)
+        pm2_corrige = prix_corrige / df.loc[masque_suspect, "surface_m2"]
+        masque_valide = pm2_corrige.between(mini, maxi)
+        indices = df.loc[masque_suspect].index[masque_valide.values]
+        df.loc[indices, "price_dh"] = prix_corrige[masque_valide.values].values
+        total_corrige += masque_valide.sum()
+    print(f"Prix corriges (chiffre parasite retire) : {total_corrige}")
+    return df
+
+
+print("=" * 70)
+print("MODELE FINAL - DATASET_CLEAN_STEP2 CORRIGE")
+print("=" * 70)
+
+df = pd.read_csv(FICHIER_ENTREE)
+print(f"\nLignes chargees : {len(df)}")
+
+df = corriger_bug_prix(df)
+
+TARGET = "price_dh"
+FEATURES = [c for c in df.columns if c != TARGET]
+CATEGORICAL = ["city", "neighborhood", "property_type", "floor_appartement", "floor"]
+
+X = df[FEATURES].copy()
+y = df[TARGET]
+for col in CATEGORICAL:
+    X[col] = X[col].astype(str)
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
+print(f"Train : {len(X_train)} | Test : {len(X_test)}")
+
+# --- XGBoost ---
+preprocessor = ColumnTransformer(
+    [("categorical", OneHotEncoder(handle_unknown="ignore"), CATEGORICAL)],
+    remainder="passthrough"
+)
+pipeline_xgb = Pipeline([
+    ("preprocessing", preprocessor),
+    ("model", XGBRegressor(n_estimators=1000, learning_rate=0.03, max_depth=8,
+                            subsample=0.8, colsample_bytree=0.8,
+                            objective="reg:squarederror", random_state=42, n_jobs=-1))
+])
+print("\nEntrainement XGBoost...")
+pipeline_xgb.fit(X_train[FEATURES], y_train)
+pred_xgb = np.maximum(pipeline_xgb.predict(X_test[FEATURES]), 0)
+
+# --- CatBoost ---
+train_pool = Pool(X_train[FEATURES], y_train, cat_features=CATEGORICAL)
+test_pool = Pool(X_test[FEATURES], y_test, cat_features=CATEGORICAL)
+print("Entrainement CatBoost...")
+modele_cb = CatBoostRegressor(iterations=2000, learning_rate=0.03, depth=8,
+                                loss_function="RMSE", random_seed=42,
+                                early_stopping_rounds=100, verbose=False)
+modele_cb.fit(train_pool, eval_set=test_pool)
+pred_cb = np.maximum(modele_cb.predict(X_test[FEATURES]), 0)
+
+# --- Blend ---
+predictions_finales = POIDS_XGB * pred_xgb + (1 - POIDS_XGB) * pred_cb
+
+mae = mean_absolute_error(y_test, predictions_finales)
+rmse = np.sqrt(mean_squared_error(y_test, predictions_finales))
+r2 = r2_score(y_test, predictions_finales)
+
+print("\n" + "=" * 70)
+print("RESULTATS FINAUX")
+print("=" * 70)
+print(f"\nMAE  : {mae:,.0f} DH")
+print(f"RMSE : {rmse:,.0f} DH")
+print(f"R2   : {r2:.4f}")
+
+results = X_test.copy()
+results["prix_reel"] = y_test.values
+results["prix_predit"] = predictions_finales
+print("\nPerformance par type :")
+for t, g in results.groupby("property_type"):
+    r2_t = r2_score(g["prix_reel"], g["prix_predit"])
+    mae_t = mean_absolute_error(g["prix_reel"], g["prix_predit"])
+    print(f"  {t:12s} (n={len(g):4d}) : MAE={mae_t:,.0f}  R2={r2_t:.4f}")
+
+df.to_csv("dataset_clean_step2_corrige.csv", index=False)
+results.to_csv("predictions_finales_step2.csv", index=False, encoding="utf-8-sig")
+
+import joblib
+joblib.dump(pipeline_xgb, "xgboost_step2_final.pkl")
+modele_cb.save_model("catboost_step2_final.cbm")
+
+print("\nFichiers crees : dataset_clean_step2_corrige.csv, predictions_finales_step2.csv,")
+print("                 xgboost_step2_final.pkl, catboost_step2_final.cbm")
